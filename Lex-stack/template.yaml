@@ -1,0 +1,114 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Lex
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 15
+    MemorySize: 128
+    Tracing: Active
+
+Resources:
+  ################################
+  # IAM Role for Lex
+  ################################
+  LexRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lexv2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LexPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # For Lambda
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Sam-TeleBot-dev-a-lambda-LexIntentHandler"
+              # For CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lex/*"
+
+  ################################
+  # Lex Bot (CloudFormation)
+  ################################
+  MyLexBot:
+    Type: AWS::Lex::Bot
+    Properties:
+      RoleArn: !GetAtt LexRole.Arn
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 300  # 5min
+      Name: !Sub "${AWS::StackName}-lex"
+      BotLocales:
+        - LocaleId: "en_US"
+          NluConfidenceThreshold: 0.40
+          Intents:
+            - Name: "FallbackIntent"
+              Description: "Default intent when no other intent matches. The chatbot will echo the message."
+              ParentIntentSignature: "AMAZON.FallbackIntent"
+              FulfillmentCodeHook:
+                Enabled: true
+            - Name: "AskProfessor"
+              Description: "This intent is used when the user wants to ask a question to Professor Dumbledore. When the user types commands like ask Dumbledore, the bot will forward the question to ChatGPT and return an answer in the style of Dumbledore."
+              SampleUtterances:
+                - Utterance: "ask the professor"
+                - Utterance: "Dumbledore please answer my question"
+                - Utterance: "I want to ask Dumbledore something"
+                - Utterance: "ask Dumbledore about magic"
+              FulfillmentCodeHook:
+                Enabled: true
+                #TargetLambdaArn: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Sam-TeleBot-dev-a-lambda-LexIntentHandler"
+
+  ################################
+  # Lex Bot Version / Alias
+  ################################
+  MyLexBotVersion:
+    Type: AWS::Lex::BotVersion
+    DependsOn: MyLexBot
+    Properties:
+      BotId: !Ref MyLexBot
+      BotVersionLocaleSpecification:
+        - LocaleId: en_US
+          BotVersionLocaleDetails:
+            SourceBotVersion: DRAFT
+
+  MyLexBotAlias:
+    Type: AWS::Lex::BotAlias
+    DependsOn: MyLexBotVersion
+    Properties:
+      BotId: !Ref MyLexBot
+      BotVersion: !GetAtt MyLexBotVersion.BotVersion
+      BotAliasName: !Sub "${AWS::StackName}Prod"
+      SentimentAnalysisSettings:
+        DetectSentiment: false
+
+################################
+# Outputs (export for backend-stack)
+################################
+Outputs:
+  LexBotId:
+    Description: Lex Bot ID
+    Value: !Ref MyLexBot
+    Export:
+      Name: LexBotId-Export
+
+  LexBotAliasId:
+    Description: Lex Bot Alias ID
+    #Value: !Ref MyLexBotAlias
+    Value: !GetAtt MyLexBotAlias.BotAliasId
+    Export:
+      Name: LexBotAliasId-Export

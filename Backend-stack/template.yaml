@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Telegram Webhook → API Gateway → Lambda1 → SQS(process/DLQ) → Lambda2 → Lex → Lambda3 +DynamoDB
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 15
+    MemorySize: 128
+    Tracing: Active
+
+Resources:
+  ################################
+  # DynamoDB
+  ################################
+  UsersTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      PrimaryKey:
+        Name: user_id
+        Type: String
+      TableName: !Sub "${AWS::StackName}-Users"
+
+  LogsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-Logs"
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH   # Partition key
+        - AttributeName: timestamp
+          KeyType: RANGE  # Sort key
+      BillingMode: PAY_PER_REQUEST
+
+  ################################
+  # SQS Queue (DLQ)
+  ################################
+  DLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-sqs-dlq"
+      MessageRetentionPeriod: 1209600   # 14days
+      VisibilityTimeout: 60
+
+  ################################
+  # SQS Queue (process)
+  ################################
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-sqs"
+      MessageRetentionPeriod: 1209600   # 14days
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DLQ.Arn
+        maxReceiveCount: 3
+
+  ################################
+  # API Gateway
+  ################################
+  TelegramWebhookApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-apigw"
+      StageName: dev
+
+  ################################
+  # Lambda1 (Telegram → SQS + DynamoDB)
+  ################################
+  Lambda1:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-lambda-TelegramToSQS"
+      CodeUri: src/lambda1/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.11
+      Environment:
+        Variables:
+          USERS_TABLE_NAME: !Ref UsersTable
+          SQS_QUEUE_URL: !Ref ProcessingQueue
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ProcessingQueue.QueueName
+        - AWSLambdaBasicExecutionRole
+      Events:
+        TelegramWebhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TelegramWebhookApi
+            Path: /webhook
+            Method: POST
+
+  ################################
+  # Lambda2 (SQS → Lex + DynamoDB)
+  ################################
+  Lambda2:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-lambda-LexBridge"
+      CodeUri: src/lambda2/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.11
+      Timeout: 15
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DLQ.Arn
+      Environment:
+        Variables:
+          LOGS_TABLE_NAME: !Ref LogsTable
+          LEX_BOT_ID: !ImportValue LexBotId-Export
+          LEX_BOT_ALIAS_ID: !ImportValue LexBotAliasId-Export
+          LEX_LOCALE_ID: en_US
+          TELEGRAM_TOKEN: "" #TODO
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LogsTable
+        - SQSPollerPolicy:
+            QueueName: !Ref ProcessingQueue
+        - AWSLambdaBasicExecutionRole
+        # Permissions for Lex are inline because there is no template in SAM.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - lex:RecognizeText
+              Resource: "*"
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ProcessingQueue.Arn
+            BatchSize: 1
+
+  ################################
+  # Lambda3 (Lex → Telegram)
+  ################################
+  Lambda3:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-lambda-LexIntentHandler"
+      CodeUri: src/lambda3/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.11
+      Timeout: 15
+      Environment:
+        Variables:
+          OPENAI_API_KEY: "" #TODO
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+  ################################
+  # Lambda Permission: Lex -> Lambda3
+  ################################
+  LexInvokePermissionForLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Lambda3
+      Principal: lexv2.amazonaws.com
+      SourceArn: !Sub
+        - "arn:aws:lex:${Region}:${AccountId}:bot-alias/${BotId}/${BotAliasId}"
+        - Region: !Ref "AWS::Region"
+          AccountId: !Ref "AWS::AccountId"
+          BotId: !ImportValue LexBotId-Export
+          BotAliasId: !ImportValue LexBotAliasId-Export
+
+################################
+# Outputs (refference for stackB)
+################################
+Outputs:
+  LogsTableName:
+    Description: DynamoDB Table name
+    Value: !Ref LogsTable
+
+  ProcessingQueue:
+    Description: URL of main log queue
+    Value: !Ref ProcessingQueue
+
+  Lambda3Arn:
+    Description: ARN of Lex fulfillment Lambda (for Stack B)
+    Value: !GetAtt Lambda3.Arn
+    Export:
+      Name: Lambda3Arn-Export
